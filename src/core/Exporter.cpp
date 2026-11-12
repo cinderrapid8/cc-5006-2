@@ -28,12 +28,6 @@ static QString avErr(int code)
     return QString::fromUtf8(buf);
 }
 
-QString Exporter::slowmoModeName(SlowmoMode m)
-{
-    return m == SlowmoMode::Interpolate ? QStringLiteral("interpolate (linear blend)")
-                                        : QStringLiteral("repeat (duplicate frames)");
-}
-
 QString Exporter::audioModeName(AudioMode m)
 {
     switch (m) {
@@ -46,19 +40,83 @@ QString Exporter::audioModeName(AudioMode m)
 
 Exporter::Exporter(VideoDecoder& decoder) : m_dec(decoder) {}
 
-static QImage blendImages(const QImage& a, const QImage& b, double w)
+namespace {
+
+// Per-segment pitch-preserving tempo chain. atempo accepts [0.5, 100]; slower
+// factors are stacked as chained 0.5 stages like the legacy constant path did.
+QString atempoChain(double speed)
 {
-    QImage out(a.size(), QImage::Format_RGB888);
-    const int bytes = a.width() * a.height() * 3;
-    const auto* pa = a.constBits();
-    const auto* pb = b.constBits();
-    auto* po = out.bits();
-    const int wa = static_cast<int>((1.0 - w) * 256.0 + 0.5);
-    const int wb = 256 - wa;
-    for (int i = 0; i < bytes; ++i)
-        po[i] = static_cast<uint8_t>((pa[i] * wa + pb[i] * wb) >> 8);
-    return out;
+    QString chain;
+    double remaining = speed;
+    while (remaining < 0.5 - 1e-9) {
+        chain += QStringLiteral("atempo=0.5,");
+        remaining /= 0.5;
+    }
+    chain += QStringLiteral("atempo=%1").arg(remaining, 0, 'f', 6);
+    return chain;
 }
+
+struct AtempoStage {
+    AVFilterGraph* graph = nullptr;
+    AVFilterContext* src = nullptr;
+    AVFilterContext* sink = nullptr;
+};
+
+struct AtempoParams {
+    AVRational timeBase;
+    int sampleRate = 0;
+};
+
+// Build one filter graph per output segment. A fresh graph per segment means
+// its algorithmic delay is fully drained (EOF flush) before the next segment
+// starts, so no filter tail can bleed across a speed change or a freeze.
+bool buildAtempo(const AtempoParams& params, double speed, AtempoStage& out,
+                 QString* err)
+{
+    out.graph = avfilter_graph_alloc();
+    if (!out.graph) { *err = QStringLiteral("filter graph alloc failed"); return false; }
+    char args[512];
+    snprintf(args, sizeof(args),
+             "time_base=%d/%d:sample_rate=%d:sample_fmt=fltp:channel_layout=stereo",
+             params.timeBase.num, params.timeBase.den, params.sampleRate);
+    if (avfilter_graph_create_filter(&out.src, avfilter_get_by_name("abuffer"),
+                                     "in", args, nullptr, out.graph) < 0) {
+        *err = QStringLiteral("abuffer create failed"); return false;
+    }
+    if (avfilter_graph_create_filter(&out.sink, avfilter_get_by_name("abuffersink"),
+                                     "out", nullptr, nullptr, out.graph) < 0) {
+        *err = QStringLiteral("abuffersink create failed"); return false;
+    }
+    // Lock the sink to the exact FLTP/stereo/rate format the encoder expects.
+    const enum AVSampleFormat sinkFmts[] = {AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_NONE};
+    av_opt_set_int_list(out.sink, "sample_fmts", sinkFmts,
+                        AV_SAMPLE_FMT_NONE, AV_OPT_SEARCH_CHILDREN);
+    av_opt_set(out.sink, "ch_layouts", "stereo", AV_OPT_SEARCH_CHILDREN);
+    av_opt_set_int(out.sink, "sample_rate", params.sampleRate,
+                   AV_OPT_SEARCH_CHILDREN);
+    AVFilterInOut* outputs = avfilter_inout_alloc();
+    AVFilterInOut* inputs = avfilter_inout_alloc();
+    outputs->name = av_strdup("in");
+    outputs->filter_ctx = out.src;
+    outputs->pad_idx = 0;
+    outputs->next = nullptr;
+    inputs->name = av_strdup("out");
+    inputs->filter_ctx = out.sink;
+    inputs->pad_idx = 0;
+    inputs->next = nullptr;
+    const QByteArray chain = atempoChain(speed).toUtf8();
+    int rc = avfilter_graph_parse_ptr(out.graph, chain.constData(),
+                                      &inputs, &outputs, nullptr);
+    avfilter_inout_free(&inputs);
+    avfilter_inout_free(&outputs);
+    if (rc < 0 || avfilter_graph_config(out.graph, nullptr) < 0) {
+        *err = QStringLiteral("atempo graph config failed for speed %1").arg(speed);
+        return false;
+    }
+    return true;
+}
+
+} // namespace
 
 bool Exporter::run(const ExportSettings& s, ExportReport& report,
                    std::function<void(int, int)> progress)
@@ -74,17 +132,30 @@ bool Exporter::run(const ExportSettings& s, ExportReport& report,
                            .arg(s.startFrame).arg(s.endFrame).arg(idx.size());
         return false;
     }
-    if (!(s.speed > 0.0 && s.speed <= 1.0)) {
+    if (!s.hasCurve && !(s.speed > 0.0 && s.speed <= 1.0)) {
         report.error = QStringLiteral("speed must be in (0,1] for slow motion");
         return false;
     }
-    const int fps = qBound(1, s.outputFrameRate, 120);
-    const int64_t outStepUs = 1'000'000 / fps;
+
     const int64_t spanStartUs = idx[s.startFrame].ptsUs;
     const int64_t sourceEndUs = idx[s.endFrame].ptsUs + idx[s.endFrame].durationUs;
     const int64_t sourceSpanUs = sourceEndUs - spanStartUs;
-    const int64_t expectedDurationUs = static_cast<int64_t>(sourceSpanUs / s.speed);
-    const int totalOut = qMax(1, static_cast<int>(expectedDurationUs / outStepUs));
+
+    // ---- The single source of truth for every output frame ---------------
+    // Both the interactive preview and this render call FramePlanner::plan on
+    // the same SpeedCurve; there is no second approximation in the exporter.
+    const SpeedCurve curve = s.effectiveCurve(sourceSpanUs);
+    QString planError;
+    FramePlan plan = FramePlanner::plan(idx, s.startFrame, s.endFrame, curve,
+                                        s.outputFrameRate, s.slowmoMode, &planError);
+    if (!plan.ok) {
+        report.error = planError;
+        return false;
+    }
+    const int fps = plan.outputFrameRate;
+    const int64_t outStepUs = plan.outputStepUs;
+    const int64_t expectedDurationUs = plan.outputDurationUs;
+    const int totalOut = plan.frames.size();
 
     // ---- Load the exact source frames of the selected interval ------------
     QVector<QImage> src;
@@ -112,58 +183,7 @@ bool Exporter::run(const ExportSettings& s, ExportReport& report,
                            .arg(src.size()).arg(s.endFrame - s.startFrame + 1);
         return false;
     }
-
-    auto srcTimeUs = [&](int j) -> int64_t {
-        return idx[s.startFrame + j].ptsUs - spanStartUs;
-    };
-
-    // ---- Plan output frames with explicit provenance ----------------------
-    struct Planned { QImage image; FrameProvenance prov; };
-    QVector<Planned> planned;
-    planned.reserve(totalOut);
-    int outCount = 0;
-    while (true) {
-        const int64_t outPtsUs = outCount * outStepUs;
-        if (outPtsUs >= expectedDurationUs) break;
-        const double srcPosUs = outPtsUs * s.speed;
-
-        int j = 0;
-        while (j + 1 < src.size() && srcTimeUs(j + 1) <= srcPosUs) ++j;
-        const int64_t t0 = srcTimeUs(j);
-        const int64_t t1 = (j + 1 < src.size()) ? srcTimeUs(j + 1) : sourceSpanUs;
-        const double frac = (t1 > t0) ? (srcPosUs - t0) / double(t1 - t0) : 0.0;
-
-        FrameProvenance p;
-        p.outputIndex = outCount;
-        p.outputPtsUs = outPtsUs;
-        p.sourceFrameA = s.startFrame + j;
-        p.sourceTimeUs = spanStartUs + static_cast<int64_t>(srcPosUs);
-        QImage img;
-        if (s.slowmoMode == SlowmoMode::Interpolate && j + 1 < src.size() && frac > 0.001) {
-            p.generated = true;
-            p.sourceFrameB = s.startFrame + j + 1;
-            p.blendWeight = frac;
-            p.kind = QStringLiteral("interpolated");
-            img = blendImages(src[j], src[j + 1], frac);
-        } else if (std::fabs(srcPosUs - t0) < 1.0 && frac <= 0.001) {
-            p.generated = false;
-            p.sourceFrameB = -1;
-            p.kind = QStringLiteral("original");
-            img = src[j];
-        } else {
-            p.generated = true;
-            p.sourceFrameB = -1;
-            p.kind = QStringLiteral("repeat");
-            img = src[j];
-        }
-        planned.push_back({img, p});
-        ++outCount;
-        if (progress) progress(outCount, totalOut);
-    }
-    if (planned.isEmpty()) {
-        report.error = QStringLiteral("no output frames planned");
-        return false;
-    }
+    FramePlanner::materialise(plan, idx, s.startFrame, src, s.slowmoMode);
 
     // ---- Mux + encode ------------------------------------------------------
     const int w = m_dec.summary().width;
@@ -252,7 +272,7 @@ bool Exporter::run(const ExportSettings& s, ExportReport& report,
     rc = avformat_write_header(oc, nullptr);
     if (rc < 0) return failOut(QStringLiteral("write_header: %1").arg(avErr(rc)));
 
-    // Video encode loop.
+    // Video encode loop. Images come from the shared planner output.
     {
         SwsContext* sws = sws_getContext(w, h, AV_PIX_FMT_RGB24,
                                          w, h, AV_PIX_FMT_YUV420P,
@@ -264,8 +284,15 @@ bool Exporter::run(const ExportSettings& s, ExportReport& report,
         AVPacket* vpkt = av_packet_alloc();
 
         bool encError = false;
-        for (int i = 0; i < planned.size(); ++i) {
-            const auto& pl = planned[i];
+        for (int i = 0; i < plan.frames.size(); ++i) {
+            const auto& pl = plan.frames[i];
+            if (pl.image.isNull()) {
+                failOut(QStringLiteral("planned frame %1 has no materialised image").arg(i));
+                sws_freeContext(sws);
+                av_frame_free(&vf);
+                av_packet_free(&vpkt);
+                return false;
+            }
             av_frame_make_writable(vf);
             const uint8_t* srcData[4] = { pl.image.constBits(), nullptr, nullptr, nullptr };
             int srcStride[4] = { static_cast<int>(pl.image.bytesPerLine()), 0, 0, 0 };
@@ -278,6 +305,7 @@ bool Exporter::run(const ExportSettings& s, ExportReport& report,
                 vpkt->stream_index = vst->index;
                 av_interleaved_write_frame(oc, vpkt);
             }
+            if (progress) progress(i + 1, totalOut);
         }
         if (!encError) {
             avcodec_send_frame(vc, nullptr);
@@ -294,6 +322,11 @@ bool Exporter::run(const ExportSettings& s, ExportReport& report,
     }
 
     // ---- Audio path --------------------------------------------------------
+    // The audio timeline follows the exact same inverse segments as the
+    // video: every non-freeze segment is rendered with its own atempo graph
+    // (pitch preserved) or resampler (pitch shifted), every freeze segment is
+    // filled per the explicit freeze policy, and every graph is fully flushed
+    // so filter algorithmic delay never crosses a speed boundary.
     if (wantAudio) {
         AVFormatContext* ifmt = m_dec.formatCtx();
         const int aIdx = m_dec.summary().audioStreamIndex;
@@ -313,8 +346,7 @@ bool Exporter::run(const ExportSettings& s, ExportReport& report,
         av_seek_frame(ifmt, aIdx, startTs, AVSEEK_FLAG_BACKWARD);
         avcodec_flush_buffers(inAc);
 
-        // Stage 1: normalise every decoded frame to FLTP / stereo / its own
-        // rate, so downstream code never guesses the decoder's native format.
+        // Stage 1: normalise every decoded frame to FLTP / stereo / its own rate.
         SwrContext* normSwr = swr_alloc();
         av_opt_set_chlayout(normSwr, "in_chlayout", &inAc->ch_layout, 0);
         AVChannelLayout stereoLayout;
@@ -331,81 +363,6 @@ bool Exporter::run(const ExportSettings& s, ExportReport& report,
             return failOut(QStringLiteral("audio normaliser init failed"));
         }
 
-        // Stage 2 (DROP only): rate conversion inputRate -> speed*inputRate.
-        SwrContext* stretchSwr = nullptr;
-        const int stretchedRate = qMax(1, qRound(inAc->sample_rate * s.speed));
-        if (s.audioMode == AudioMode::Drop) {
-            stretchSwr = swr_alloc();
-            av_opt_set_chlayout(stretchSwr, "in_chlayout", &stereoLayout, 0);
-            av_opt_set_chlayout(stretchSwr, "out_chlayout", &stereoLayout, 0);
-            av_opt_set_int(stretchSwr, "in_sample_rate", inAc->sample_rate, 0);
-            av_opt_set_int(stretchSwr, "out_sample_rate", stretchedRate, 0);
-            av_opt_set_sample_fmt(stretchSwr, "in_sample_fmt", AV_SAMPLE_FMT_FLTP, 0);
-            av_opt_set_sample_fmt(stretchSwr, "out_sample_fmt", AV_SAMPLE_FMT_FLTP, 0);
-            if (swr_init(stretchSwr) < 0) {
-                swr_free(&stretchSwr);
-                swr_free(&normSwr);
-                avcodec_free_context(&inAc);
-                return failOut(QStringLiteral("audio stretch init failed"));
-            }
-        }
-
-        // Stage 2b (ATEMPO only): tempo filter, pitch preserved.
-        AVFilterGraph* graph = nullptr;
-        AVFilterContext* srcFilter = nullptr;
-        AVFilterContext* sinkFilter = nullptr;
-        if (s.audioMode == AudioMode::Atempo) {
-            QString chain;
-            double remaining = s.speed;
-            while (remaining < 0.5 - 1e-9) {
-                chain += QStringLiteral("atempo=0.5,");
-                remaining /= 0.5;
-            }
-            chain += QStringLiteral("atempo=%1").arg(remaining, 0, 'f', 6);
-
-            graph = avfilter_graph_alloc();
-            char args[512];
-            snprintf(args, sizeof(args),
-                     "time_base=%d/%d:sample_rate=%d:sample_fmt=fltp:channel_layout=stereo",
-                     inAc->pkt_timebase.num, inAc->pkt_timebase.den,
-                     inAc->sample_rate);
-            avfilter_graph_create_filter(&srcFilter, avfilter_get_by_name("abuffer"),
-                                         "in", args, nullptr, graph);
-            avfilter_graph_create_filter(&sinkFilter, avfilter_get_by_name("abuffersink"),
-                                         "out", nullptr, nullptr, graph);
-            // Lock the sink to the exact format the encoder pipeline expects.
-            const enum AVSampleFormat sinkFmts[] = {AV_SAMPLE_FMT_FLTP, AV_SAMPLE_FMT_NONE};
-            av_opt_set_int_list(sinkFilter, "sample_fmts", sinkFmts,
-                                AV_SAMPLE_FMT_NONE, AV_OPT_SEARCH_CHILDREN);
-            av_opt_set(sinkFilter, "ch_layouts", "stereo", AV_OPT_SEARCH_CHILDREN);
-            av_opt_set_int(sinkFilter, "sample_rate", inAc->sample_rate,
-                           AV_OPT_SEARCH_CHILDREN);
-            AVFilterInOut* outputs = avfilter_inout_alloc();
-            AVFilterInOut* inputs = avfilter_inout_alloc();
-            outputs->name = av_strdup("in");
-            outputs->filter_ctx = srcFilter;
-            outputs->pad_idx = 0;
-            outputs->next = nullptr;
-            inputs->name = av_strdup("out");
-            inputs->filter_ctx = sinkFilter;
-            inputs->pad_idx = 0;
-            inputs->next = nullptr;
-            avfilter_graph_parse_ptr(graph, chain.toUtf8().constData(),
-                                     &inputs, &outputs, nullptr);
-            avfilter_inout_free(&inputs);
-            avfilter_inout_free(&outputs);
-            if (avfilter_graph_config(graph, nullptr) < 0) {
-                avfilter_graph_free(&graph);
-                swr_free(&stretchSwr);
-                swr_free(&normSwr);
-                avcodec_free_context(&inAc);
-                return failOut(QStringLiteral("atempo filter graph failed"));
-            }
-        }
-
-        // Stage 3: encoder-side conversion. A dedicated resampler is created
-        // per input rate so filter-graph internal rates (which need not equal
-        // the source rate) are handled correctly.
         auto makeEncoderSwr = [&](int inputRate) {
             SwrContext* c = swr_alloc();
             av_opt_set_chlayout(c, "in_chlayout", &stereoLayout, 0);
@@ -419,16 +376,19 @@ bool Exporter::run(const ExportSettings& s, ExportReport& report,
             return c;
         };
         SwrContext* toEnc = makeEncoderSwr(inAc->sample_rate);
-        SwrContext* dropToEnc = nullptr;
-        if (s.audioMode == AudioMode::Drop)
-            dropToEnc = makeEncoderSwr(stretchedRate);
+
+        // ATEMPO parameters: every per-segment graph locks the same input and
+        // sink sample format so the encoder pipeline never sees a surprise.
+        AtempoParams atempoParams;
+        if (s.audioMode == AudioMode::Atempo) {
+            atempoParams.timeBase = inAc->pkt_timebase;
+            atempoParams.sampleRate = inAc->sample_rate;
+        }
 
         const int encFrameSize = ac->frame_size > 0 ? ac->frame_size : 1024;
         const int encChannels = ac->ch_layout.nb_channels;
         const int encBps = av_get_bytes_per_sample(ac->sample_fmt);
         const bool encPlanar = av_sample_fmt_is_planar(ac->sample_fmt);
-        // Per-channel FIFO of encoder-ready samples; avoids keeping dangling
-        // pointers into frames that were reused or freed.
         QVector<QByteArray> fifo(encChannels);
         int64_t encSamplesTotal = 0;
 
@@ -469,7 +429,7 @@ bool Exporter::run(const ExportSettings& s, ExportReport& report,
             }
         };
 
-        // Push a FLTP stereo frame, resampling at its declared sample rate.
+        // Push a FLTP stereo frame at its declared rate into the encoder FIFO.
         auto pushSamples = [&](const AVFrame* fltp, SwrContext* fixedConv) {
             SwrContext* conv = fixedConv;
             const auto swrDeleter = [](SwrContext* c) { SwrContext* p = c; swr_free(&p); };
@@ -503,101 +463,211 @@ bool Exporter::run(const ExportSettings& s, ExportReport& report,
             drainFifo();
         };
 
-        auto normalise = [&](AVFrame* decoded, AVFrame* out) -> int {
-            out->format = AV_SAMPLE_FMT_FLTP;
-            av_channel_layout_copy(&out->ch_layout, &stereoLayout);
-            out->sample_rate = inAc->sample_rate;
-            int cap = swr_get_out_samples(normSwr, decoded->nb_samples);
-            out->nb_samples = cap;
-            av_frame_get_buffer(out, 0);
-            const int got = swr_convert(normSwr, out->data, cap,
-                                        const_cast<const uint8_t**>(decoded->data),
-                                        decoded->nb_samples);
-            out->nb_samples = got;
-            return got;
+        // Append `samples` FLTP frames' worth of audio for a freeze segment.
+        auto appendFreeze = [&](int samples, const QVector<float>& lastSample) {
+            if (samples <= 0) return;
+            AVFrame* fr = av_frame_alloc();
+            fr->format = AV_SAMPLE_FMT_FLTP;
+            av_channel_layout_copy(&fr->ch_layout, &stereoLayout);
+            fr->sample_rate = inAc->sample_rate;
+            fr->nb_samples = samples;
+            av_frame_get_buffer(fr, 0);
+            for (int ch = 0; ch < qMin(2, encChannels); ++ch) {
+                const float v = s.audioFreezePolicy == AudioFreezePolicy::HoldLast
+                                    ? lastSample.value(ch, 0.0f) : 0.0f;
+                float* dst = reinterpret_cast<float*>(fr->data[ch]);
+                for (int i = 0; i < samples; ++i) dst[i] = v;
+            }
+            pushSamples(fr, toEnc);
+            av_frame_free(&fr);
         };
 
-        AVPacket* pkt = av_packet_alloc();
-        AVFrame* decFrame = av_frame_alloc();
-        AVFrame* normFrame = av_frame_alloc();
-        bool audioDone = false;
-        while (!audioDone) {
-            int r = av_read_frame(ifmt, pkt);
-            if (r == AVERROR_EOF) {
-                avcodec_send_packet(inAc, nullptr);
-            } else if (r < 0) {
-                audioDone = true;
-            } else {
-                if (pkt->stream_index != aIdx) { av_packet_unref(pkt); continue; }
-                if (pkt->pts != AV_NOPTS_VALUE && pkt->pts < startTs) {
-                    av_packet_unref(pkt);
-                    continue;
-                }
-                avcodec_send_packet(inAc, pkt);
-                av_packet_unref(pkt);
-            }
-            while (true) {
-                r = avcodec_receive_frame(inAc, decFrame);
-                if (r == AVERROR(EAGAIN)) break;
-                if (r == AVERROR_EOF) { audioDone = true; break; }
-                if (r < 0) { audioDone = true; break; }
-                if (decFrame->pts == AV_NOPTS_VALUE) { av_frame_unref(decFrame); continue; }
-                if (decFrame->pts > endTs) { audioDone = true; break; }
-
-                if (normalise(decFrame, normFrame) <= 0) {
-                    av_frame_unref(decFrame);
-                    continue;
-                }
-
-                if (s.audioMode == AudioMode::Atempo) {
-                    normFrame->pts = av_rescale_q(decFrame->pts,
-                                                  ifmt->streams[aIdx]->time_base,
-                                                  AVRational{1, 1'000'000}) - spanStartUs;
-                    if (av_buffersrc_add_frame_flags(srcFilter, normFrame, 0) < 0) {
-                        audioDone = true;
-                        break;
-                    }
-                    AVFrame* filt = av_frame_alloc();
-                    while (av_buffersink_get_frame(sinkFilter, filt) >= 0) {
-                        pushSamples(filt, toEnc);
-                        av_frame_unref(filt);
-                    }
-                    av_frame_free(&filt);
+        // Decode the whole selected source range once into normalised FLTP
+        // frames. Segmentation afterwards is pure timeline bookkeeping, so the
+        // mapping used for audio matches the video mapping exactly.
+        struct NormFrame { QByteArray ch[2]; int64_t ptsUs = 0; int samples = 0; };
+        QVector<NormFrame> normFrames;
+        QVector<float> lastSample{0.0f, 0.0f};
+        {
+            AVPacket* pkt = av_packet_alloc();
+            AVFrame* decFrame = av_frame_alloc();
+            AVFrame* normFrame = av_frame_alloc();
+            bool audioDone = false;
+            while (!audioDone) {
+                int r = av_read_frame(ifmt, pkt);
+                if (r == AVERROR_EOF) {
+                    avcodec_send_packet(inAc, nullptr);
+                } else if (r < 0) {
+                    audioDone = true;
                 } else {
-                    // DROP: fewer samples per source second; replayed at 48 kHz
-                    // they span 1/speed seconds, with pitch shifted downward.
-                    AVFrame* stretched = av_frame_alloc();
-                    stretched->format = AV_SAMPLE_FMT_FLTP;
-                    av_channel_layout_copy(&stretched->ch_layout, &stereoLayout);
-                    stretched->sample_rate = stretchedRate;
-                    int cap = swr_get_out_samples(stretchSwr, normFrame->nb_samples);
-                    stretched->nb_samples = cap;
-                    av_frame_get_buffer(stretched, 0);
-                    const int got = swr_convert(
-                        stretchSwr, stretched->data, cap,
-                        const_cast<const uint8_t**>(normFrame->data),
-                        normFrame->nb_samples);
-                    if (got > 0) {
-                        stretched->nb_samples = got;
-                        pushSamples(stretched, dropToEnc);
+                    if (pkt->stream_index != aIdx) { av_packet_unref(pkt); continue; }
+                    if (pkt->pts != AV_NOPTS_VALUE && pkt->pts < startTs) {
+                        av_packet_unref(pkt);
+                        continue;
                     }
-                    av_frame_free(&stretched);
+                    avcodec_send_packet(inAc, pkt);
+                    av_packet_unref(pkt);
                 }
-                av_frame_unref(normFrame);
-                av_frame_unref(decFrame);
+                while (true) {
+                    r = avcodec_receive_frame(inAc, decFrame);
+                    if (r == AVERROR(EAGAIN)) break;
+                    if (r == AVERROR_EOF) { audioDone = true; break; }
+                    if (r < 0) { audioDone = true; break; }
+                    if (decFrame->pts == AV_NOPTS_VALUE) { av_frame_unref(decFrame); continue; }
+                    if (decFrame->pts > endTs) { audioDone = true; break; }
+
+                    normFrame->format = AV_SAMPLE_FMT_FLTP;
+                    av_channel_layout_copy(&normFrame->ch_layout, &stereoLayout);
+                    normFrame->sample_rate = inAc->sample_rate;
+                    int cap = swr_get_out_samples(normSwr, decFrame->nb_samples);
+                    normFrame->nb_samples = cap;
+                    av_frame_get_buffer(normFrame, 0);
+                    const int got = swr_convert(normSwr, normFrame->data, cap,
+                                                const_cast<const uint8_t**>(decFrame->data),
+                                                decFrame->nb_samples);
+                    if (got <= 0) { av_frame_unref(decFrame); continue; }
+                    normFrame->nb_samples = got;
+                    NormFrame nf;
+                    nf.samples = got;
+                    nf.ptsUs = av_rescale_q(decFrame->pts,
+                                            ifmt->streams[aIdx]->time_base,
+                                            AVRational{1, 1'000'000}) - spanStartUs;
+                    for (int ch = 0; ch < 2; ++ch)
+                        nf.ch[ch] = QByteArray(reinterpret_cast<const char*>(normFrame->data[ch]),
+                                               got * int(sizeof(float)));
+                    lastSample[0] = reinterpret_cast<const float*>(nf.ch[0].constData())[got - 1];
+                    lastSample[1] = reinterpret_cast<const float*>(nf.ch[1].constData())[got - 1];
+                    normFrames.push_back(std::move(nf));
+                    av_frame_unref(normFrame);
+                    av_frame_unref(decFrame);
+                }
+                if (r == AVERROR_EOF) break;
             }
-            if (r == AVERROR_EOF) break;
+            av_frame_free(&normFrame);
+            av_frame_free(&decFrame);
+            av_packet_free(&pkt);
         }
 
-        if (s.audioMode == AudioMode::Atempo) {
-            (void)av_buffersrc_add_frame_flags(srcFilter, nullptr, 0);
-            AVFrame* filt = av_frame_alloc();
-            while (av_buffersink_get_frame(sinkFilter, filt) >= 0) {
-                pushSamples(filt, toEnc);
-                av_frame_unref(filt);
+        // Slice normalised frames belonging to source interval [a,b) (rel us).
+        auto sliceSource = [&](int64_t a, int64_t b) -> AVFrame* {
+            AVFrame* part = av_frame_alloc();
+            part->format = AV_SAMPLE_FMT_FLTP;
+            av_channel_layout_copy(&part->ch_layout, &stereoLayout);
+            part->sample_rate = inAc->sample_rate;
+            QVector<QByteArray> buf(2);
+            int total = 0;
+            for (const auto& nf : normFrames) {
+                const int64_t fStart = nf.ptsUs;
+                const int64_t fEnd = nf.ptsUs
+                    + av_rescale_q(nf.samples, AVRational{1, inAc->sample_rate},
+                                   AVRational{1, 1'000'000});
+                if (fEnd <= a || fStart >= b) continue;
+                // Convert us bounds inside this frame to sample indices.
+                const int64_t sampleDurUs = 1'000'000 / int64_t(inAc->sample_rate);
+                int i0 = qBound(0, int((a - fStart) / qMax<int64_t>(1, sampleDurUs)),
+                                nf.samples);
+                int i1 = qBound(0, int((b - fStart) / qMax<int64_t>(1, sampleDurUs)),
+                                nf.samples);
+                if (i1 <= i0) continue;
+                for (int ch = 0; ch < 2; ++ch)
+                    buf[ch].append(nf.ch[ch].constData() + i0 * int(sizeof(float)),
+                                   (i1 - i0) * int(sizeof(float)));
+                total += i1 - i0;
             }
-            av_frame_free(&filt);
+            part->nb_samples = total;
+            if (total > 0) av_frame_get_buffer(part, 0);
+            for (int ch = 0; ch < 2; ++ch)
+                memcpy(part->data[ch], buf[ch].constData(), total * int(sizeof(float)));
+            return part;
+        };
+
+        // Render one moving (non-freeze) segment through the real component
+        // that implements the requested audio semantics.
+        auto renderMoving = [&](const SpeedCurve::Segment& seg) {
+            AVFrame* part = sliceSource(seg.srcStartUs, seg.srcEndUs);
+            if (part->nb_samples <= 0) { av_frame_free(&part); return; }
+            if (s.audioMode == AudioMode::Atempo) {
+                AtempoStage st;
+                QString gerr;
+                if (!buildAtempo(atempoParams, seg.speed, st, &gerr)) {
+                    report.error = gerr;
+                    av_frame_free(&part);
+                    return;
+                }
+                part->pts = av_rescale_q(seg.srcStartUs,
+                                         AVRational{1, 1'000'000},
+                                         AVRational{1, inAc->sample_rate});
+                if (av_buffersrc_add_frame_flags(st.src, part, 0) < 0) {
+                    report.error = QStringLiteral("atempo segment input failed");
+                    av_frame_free(&part);
+                    avfilter_graph_free(&st.graph);
+                    return;
+                }
+                av_frame_free(&part);
+                // EOF flush: atempo buffering/algorithmic delay is drained in
+                // full before the next segment is built.
+                rc = av_buffersrc_add_frame_flags(st.src, nullptr, 0);
+                (void)rc;
+                AVFrame* filt = av_frame_alloc();
+                while (av_buffersink_get_frame(st.sink, filt) >= 0) {
+                    pushSamples(filt, toEnc);
+                    av_frame_unref(filt);
+                }
+                av_frame_free(&filt);
+                avfilter_graph_free(&st.graph);
+            } else {
+                // DROP: resample to speed*rate, replay at the encoder rate.
+                const int stretchedRate = qMax(1, qRound(inAc->sample_rate * seg.speed));
+                SwrContext* stretchSwr = swr_alloc();
+                av_opt_set_chlayout(stretchSwr, "in_chlayout", &stereoLayout, 0);
+                av_opt_set_chlayout(stretchSwr, "out_chlayout", &stereoLayout, 0);
+                av_opt_set_int(stretchSwr, "in_sample_rate", inAc->sample_rate, 0);
+                av_opt_set_int(stretchSwr, "out_sample_rate", stretchedRate, 0);
+                av_opt_set_sample_fmt(stretchSwr, "in_sample_fmt", AV_SAMPLE_FMT_FLTP, 0);
+                av_opt_set_sample_fmt(stretchSwr, "out_sample_fmt", AV_SAMPLE_FMT_FLTP, 0);
+                swr_init(stretchSwr);
+                SwrContext* conv = makeEncoderSwr(stretchedRate);
+                int cap = swr_get_out_samples(stretchSwr, part->nb_samples);
+                AVFrame* stretched = av_frame_alloc();
+                stretched->format = AV_SAMPLE_FMT_FLTP;
+                av_channel_layout_copy(&stretched->ch_layout, &stereoLayout);
+                stretched->sample_rate = stretchedRate;
+                stretched->nb_samples = cap;
+                av_frame_get_buffer(stretched, 0);
+                const int got = swr_convert(stretchSwr, stretched->data, cap,
+                                            const_cast<const uint8_t**>(part->data),
+                                            part->nb_samples);
+                if (got > 0) {
+                    stretched->nb_samples = got;
+                    pushSamples(stretched, conv);
+                }
+                av_frame_free(&stretched);
+                av_frame_free(&part);
+                swr_free(&conv);
+                swr_free(&stretchSwr);
+            }
+        };
+
+        const auto segs = curve.inverseSegments();
+        for (const auto& seg : segs) {
+            if (seg.speed == 0.0) {
+                const int samples = qMax(0, int(av_rescale_q(
+                    seg.outEndUs - seg.outStartUs,
+                    AVRational{1, 1'000'000},
+                    AVRational{1, inAc->sample_rate})));
+                appendFreeze(samples, lastSample);
+            } else {
+                renderMoving(seg);
+                if (!report.error.isEmpty()) {
+                    swr_free(&toEnc);
+                    swr_free(&normSwr);
+                    av_channel_layout_uninit(&stereoLayout);
+                    avcodec_free_context(&inAc);
+                    return failOut(report.error);
+                }
+            }
         }
+
         // Pad the remaining samples to a full encoder frame.
         if (!fifo.isEmpty() && !fifo[0].isEmpty()) {
             const int have = encPlanar ? fifo[0].size() / encBps
@@ -620,14 +690,9 @@ bool Exporter::run(const ExportSettings& s, ExportReport& report,
             av_interleaved_write_frame(oc, ap);
         }
         av_packet_free(&ap);
-        av_frame_free(&normFrame);
-        av_frame_free(&decFrame);
-        av_packet_free(&pkt);
-        swr_free(&dropToEnc);
         swr_free(&toEnc);
-        swr_free(&stretchSwr);
         swr_free(&normSwr);
-        if (graph) avfilter_graph_free(&graph);
+        
         av_channel_layout_uninit(&stereoLayout);
         avcodec_free_context(&inAc);
         report.hasAudio = true;
@@ -637,14 +702,17 @@ bool Exporter::run(const ExportSettings& s, ExportReport& report,
     if (ioOpened) avio_closep(&oc->pb);
 
     report.ok = true;
+    report.curve = curve;
     report.outputPath = s.outputPath;
-    report.outputFrameCount = planned.size();
+    report.outputFrameCount = plan.frames.size();
     report.sourceSpanUs = sourceSpanUs;
     report.expectedDurationUs = expectedDurationUs;
-    report.outputDurationUs = planned.last().prov.outputPtsUs + outStepUs;
-    for (const auto& pl : planned) {
-        report.frames.push_back(pl.prov);
-        if (pl.prov.generated) ++report.generatedFrameCount;
+    report.outputDurationUs = plan.frames.last().prov.outputPtsUs + outStepUs;
+    for (const auto& pf : plan.frames) {
+        const auto& p = pf.prov;
+        report.frames.push_back(p);
+        if (p.kind == QLatin1String("freeze")) ++report.freezeFrameCount;
+        if (p.generated) ++report.generatedFrameCount;
         else ++report.originalFrameCount;
     }
     report.sidecarPath = s.outputPath + QStringLiteral(".frames.json");
@@ -653,7 +721,10 @@ bool Exporter::run(const ExportSettings& s, ExportReport& report,
         meta["tool"] = QStringLiteral("sportreview");
         meta["slowmoMode"] = slowmoModeName(s.slowmoMode);
         meta["audioMode"] = audioModeName(s.audioMode);
-        meta["speed"] = s.speed;
+        meta["audioFreezePolicy"] = audioFreezePolicyName(s.audioFreezePolicy);
+        meta["hasCurve"] = s.hasCurve;
+        meta["legacySpeed"] = s.speed;
+        meta["speedCurve"] = curve.toJson();
         meta["outputFrameRate"] = fps;
         meta["startFrame"] = s.startFrame;
         meta["endFrame"] = s.endFrame;
@@ -662,6 +733,7 @@ bool Exporter::run(const ExportSettings& s, ExportReport& report,
         meta["containerTickUs"] = static_cast<qint64>(containerTickUs);
         meta["originalFrames"] = report.originalFrameCount;
         meta["generatedFrames"] = report.generatedFrameCount;
+        meta["freezeFrames"] = report.freezeFrameCount;
         QJsonArray farr;
         for (const auto& p : report.frames) {
             QJsonObject po;
@@ -673,6 +745,8 @@ bool Exporter::run(const ExportSettings& s, ExportReport& report,
             po["sourceFrameB"] = p.sourceFrameB;
             po["blendWeight"] = p.blendWeight;
             po["sourceTimeUs"] = static_cast<qint64>(p.sourceTimeUs);
+            po["segmentIndex"] = p.segmentIndex;
+            po["localSpeed"] = p.localSpeed;
             farr.append(po);
         }
         meta["frames"] = farr;

@@ -45,6 +45,37 @@ static SourceSummary sourceFromJson(const QJsonObject& o)
 
 Project::Project() = default;
 
+QJsonObject ExportConfig::toJson() const
+{
+    QJsonObject o;
+    o["startFrame"] = startFrame;
+    o["endFrame"] = endFrame;
+    o["hasCurve"] = hasCurve;
+    o["speed"] = speed;
+    o["slowmoMode"] = slowmoMode;
+    o["audioMode"] = audioMode;
+    o["audioFreezePolicy"] = audioFreezePolicy;
+    o["outputFrameRate"] = outputFrameRate;
+    o["speedCurve"] = curve.toJson();
+    return o;
+}
+
+ExportConfig ExportConfig::fromJson(const QJsonObject& o)
+{
+    ExportConfig c;
+    c.startFrame = o.value("startFrame").toInt(0);
+    c.endFrame = o.value("endFrame").toInt(0);
+    c.hasCurve = o.value("hasCurve").toBool(false);
+    c.speed = o.value("speed").toDouble(0.5);
+    c.slowmoMode = o.value("slowmoMode").toInt(0);
+    c.audioMode = o.value("audioMode").toInt(0);
+    c.audioFreezePolicy = o.value("audioFreezePolicy").toInt(0);
+    c.outputFrameRate = o.value("outputFrameRate").toInt(60);
+    if (o.contains("speedCurve"))
+        c.curve = SpeedCurve::fromJson(o.value("speedCurve").toObject());
+    return c;
+}
+
 int Project::addMarker(int frameIndex, int64_t ptsUs, MarkerPhase phase, const QString& note)
 {
     if (auto* existing = markerAt(frameIndex)) {
@@ -127,6 +158,8 @@ bool Project::save(const QString& filePath, QString* err)
     for (const auto& m : m_markers) arr.append(markerToJson(m));
     root["markers"] = arr;
     root["nextMarkerId"] = m_nextMarkerId;
+    if (m_hasExport)
+        root["exportConfig"] = m_export.toJson();
 
     QFile f(filePath);
     if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -151,7 +184,10 @@ bool Project::load(const QString& filePath, QString* err)
         return false;
     }
     const QJsonObject root = doc.object();
-    if (root.value("formatVersion").toInt() != fileFormatVersion) {
+    const int version = root.value("formatVersion").toInt();
+    // v1 projects predate segmented speed curves. They carry no curve, so the
+    // legacy constant-speed path is preserved and re-renders identically.
+    if (version != fileFormatVersion && version != legacyFileFormatVersion) {
         if (err) *err = QStringLiteral("unsupported project format version");
         return false;
     }
@@ -161,6 +197,13 @@ bool Project::load(const QString& filePath, QString* err)
     for (const auto& v : arr)
         m_markers.push_back(markerFromJson(v.toObject()));
     m_nextMarkerId = root.value("nextMarkerId").toInt(m_markers.size() + 1);
+    if (root.contains("exportConfig")) {
+        m_export = ExportConfig::fromJson(root.value("exportConfig").toObject());
+        m_hasExport = true;
+    } else {
+        m_export = ExportConfig{};
+        m_hasExport = false;
+    }
     m_path = filePath;
     return true;
 }

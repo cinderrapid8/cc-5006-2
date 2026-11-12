@@ -1,16 +1,13 @@
 #pragma once
 
-#include "core/Types.h"
+#include "core/FramePlanner.h"
+#include "core/SpeedCurve.h"
 #include "core/VideoDecoder.h"
 #include <QJsonObject>
 #include <QVector>
+#include <functional>
 
 namespace sr {
-
-enum class SlowmoMode {
-    Repeat = 0,      // explicit frame repetition, no synthesis
-    Interpolate = 1, // linear blend between adjacent source frames
-};
 
 enum class AudioMode {
     Mute = 0,        // no audio stream in the output
@@ -22,21 +19,26 @@ struct ExportSettings {
     QString outputPath;
     int startFrame = 0;          // inclusive, unique source frame number
     int endFrame = 0;            // inclusive
-    double speed = 0.5;          // 0.5 -> 2x duration
+
+    // Primary timing definition. When hasCurve is true the exporter uses this
+    // mapping for both the preview-cached frame selection and the render.
+    // When false the legacy constant `speed` is wrapped into a one-segment
+    // SpeedCurve (the historical constant slow-motion special case).
+    bool hasCurve = false;
+    SpeedCurve curve;
+    double speed = 0.5;          // legacy constant speed, 0.5 -> 2x duration
+
     SlowmoMode slowmoMode = SlowmoMode::Repeat;
     AudioMode audioMode = AudioMode::Mute;
+    AudioFreezePolicy audioFreezePolicy = AudioFreezePolicy::Silence;
     int outputFrameRate = 60;    // fixed output clock, up to 120
-};
 
-struct FrameProvenance {
-    int outputIndex = 0;
-    int64_t outputPtsUs = 0;
-    bool generated = true;       // true = produced by repeat/interpolation
-    int sourceFrameA = -1;
-    int sourceFrameB = -1;       // -1 in repeat/original case
-    double blendWeight = 0.0;    // weight of B in an interpolated frame
-    int64_t sourceTimeUs = 0;    // source timeline position represented
-    QString kind;                // "original" | "repeat" | "interpolated"
+    // Effective mapping regardless of which field populated it.
+    SpeedCurve effectiveCurve(int64_t spanUs) const
+    {
+        if (hasCurve) return curve;
+        return SpeedCurve::constant(speed, spanUs);
+    }
 };
 
 struct ExportReport {
@@ -47,6 +49,7 @@ struct ExportReport {
     int outputFrameCount = 0;
     int originalFrameCount = 0;
     int generatedFrameCount = 0;
+    int freezeFrameCount = 0;
     int64_t outputDurationUs = 0;
     int64_t expectedDurationUs = 0;
     int64_t sourceSpanUs = 0;
@@ -54,6 +57,7 @@ struct ExportReport {
     int endFrame = -1;
     bool hasAudio = false;
     AudioMode audioMode = AudioMode::Mute;
+    SpeedCurve curve;
     QVector<FrameProvenance> frames;
 };
 
@@ -64,7 +68,6 @@ public:
     bool run(const ExportSettings& s, ExportReport& report,
              std::function<void(int, int)> progress = nullptr);
 
-    static QString slowmoModeName(SlowmoMode m);
     static QString audioModeName(AudioMode m);
 
 private:

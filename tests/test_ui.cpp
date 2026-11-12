@@ -1,7 +1,10 @@
 #include "ui/MainWindow.h"
+#include "ui/CurveEditor.h"
+#include "ui/ExportDialog.h"
 #include "core/VideoDecoder.h"
 
 #include <QApplication>
+#include <QCheckBox>
 #include <QDir>
 #include <QFileInfo>
 #include <QLabel>
@@ -9,6 +12,7 @@
 #include <QProcess>
 #include <QPushButton>
 #include <QSpinBox>
+#include <QTableWidget>
 #include <QTest>
 #include <QTimer>
 
@@ -154,6 +158,81 @@ private slots:
         QVERIFY(w2.loadProjectFrom(projPath));
         QCOMPARE(w2.markerCount(), 1);
         QVERIFY(w2.findChild<QSpinBox*>()->isEnabled());
+    }
+
+    void curveEditorShowsActualOutputLengthAndRejectsBadCurve()
+    {
+        CurveEditor editor;
+        editor.setSourceSpan(1'000'000);
+        editor.resetToConstant(0.5);
+        QVERIFY(editor.isValid());
+        // Constant 0.5 over 1 s -> 2 s output.
+        QCOMPARE(editor.outputDurationUs(), 2'000'000);
+
+        // A segmented curve: enter at 1.0, slow to 0.1 in the middle, hold,
+        // then exit at 0.8. The displayed length must match the mapping math.
+        SpeedCurve c;
+        c.setKnots({{0, 1.0, 0},
+                    {250'000, 0.1, 0},
+                    {500'000, 0.8, 100'000},
+                    {1'000'000, 0.8, 0}});
+        editor.setCurve(c);
+        QVERIFY(editor.isValid());
+        QCOMPARE(editor.outputDurationUs(), c.outputDurationUs());
+        QVERIFY(editor.outputDurationUs() > 2'000'000); // slowdown + hold stretch
+
+        // Negative speed must surface as invalid with an explanatory message.
+        SpeedCurve bad;
+        bad.setKnots({{0, 0.5, 0}, {500'000, -0.2, 0}, {1'000'000, 0.5, 0}});
+        editor.setCurve(bad);
+        QString reason;
+        QVERIFY(!editor.isValid(&reason));
+        QVERIFY(reason.contains("rejected speed"));
+
+        // The metrics label reflects the invalid state rather than a length.
+        bool sawInvalid = false;
+        for (auto* l : editor.findChildren<QLabel*>())
+            if (l->text().contains("Invalid curve")) sawInvalid = true;
+        QVERIFY(sawInvalid);
+        QCOMPARE(editor.outputDurationUs(), -1);
+
+        editor.resetToConstant(0.25);
+        QVERIFY(editor.isValid());
+        QCOMPARE(editor.outputDurationUs(), 4'000'000);
+    }
+
+    void exportDialogPersistsCurveThroughProject()
+    {
+        const QString clip = gen("dlg.mkv");
+        QVERIFY(!clip.isEmpty());
+        VideoDecoder dec;
+        QVERIFY(dec.open(clip));
+        QVERIFY(dec.buildIndex());
+        const auto& idx = dec.index();
+        const int64_t span = idx.last().ptsUs + idx.last().durationUs
+                             - idx.first().ptsUs;
+
+        ExportConfig initial;
+        initial.startFrame = 1;
+        initial.endFrame = dec.frameCount() - 2;
+        initial.hasCurve = true;
+        initial.curve.setKnots({{0, 1.0, 0}, {span / 2, 0.1, 60'000},
+                                 {span, 0.8, 0}});
+        initial.outputFrameRate = 60;
+        ExportDialog dlg(dec.frameCount(), dec.summary().audioStreamIndex,
+                         dec.index(), &initial);
+        auto* useCurve = dlg.findChild<QCheckBox*>();
+        QVERIFY(useCurve && useCurve->isChecked());
+        const auto got = dlg.exportConfig();
+        QCOMPARE(got.hasCurve, true);
+        QCOMPARE(got.curve.knots().size(), initial.curve.knots().size());
+        QCOMPARE(got.curve.outputDurationUs(), initial.curve.outputDurationUs());
+
+        // Switching the curve off restores the constant special case.
+        useCurve->setChecked(false);
+        const auto constCfg = dlg.exportConfig();
+        QCOMPARE(constCfg.hasCurve, false);
+        QVERIFY(constCfg.speed > 0.0 && constCfg.speed <= 1.0);
     }
 };
 

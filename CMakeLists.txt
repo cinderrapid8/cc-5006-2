@@ -23,6 +23,8 @@ add_library(sr_core STATIC
     src/core/Types.cpp
     src/core/VideoDecoder.cpp
     src/core/Project.cpp
+    src/core/SpeedCurve.cpp
+    src/core/FramePlanner.cpp
     src/core/Exporter.cpp
 )
 target_include_directories(sr_core PUBLIC src)
@@ -32,6 +34,7 @@ add_executable(sportreview
     src/ui/main.cpp
     src/ui/MainWindow.cpp
     src/ui/ExportDialog.cpp
+    src/ui/CurveEditor.cpp
 )
 target_link_libraries(sportreview PRIVATE sr_core Qt6::Widgets)
 
@@ -40,6 +43,9 @@ target_link_libraries(srt_probe PRIVATE sr_core)
 
 add_executable(srt_genclip tools/genclip_main.cpp)
 target_link_libraries(srt_genclip PRIVATE sr_core Qt6::Gui)
+
+add_executable(srt_curve_demo tools/acceptance/curve_demo_main.cpp)
+target_link_libraries(srt_curve_demo PRIVATE sr_core)
 
 add_executable(test_core tests/test_core.cpp)
 target_link_libraries(test_core PRIVATE sr_core Qt6::Test)
@@ -50,6 +56,7 @@ add_executable(test_ui
     tests/test_ui.cpp
     src/ui/MainWindow.cpp
     src/ui/ExportDialog.cpp
+    src/ui/CurveEditor.cpp
 )
 target_link_libraries(test_ui PRIVATE sr_core Qt6::Widgets Qt6::Test)
 add_test(NAME ui COMMAND test_ui)

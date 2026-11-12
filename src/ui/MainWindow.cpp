@@ -424,10 +424,16 @@ void MainWindow::loadProject()
 void MainWindow::exportRange()
 {
     if (!m_decoder.isOpen()) return;
+    const ExportConfig* initial = m_project.hasExportConfig()
+                                      ? &m_project.exportConfig() : nullptr;
     ExportDialog dlg(m_decoder.frameCount(),
-                     m_decoder.summary().audioStreamIndex, this);
+                     m_decoder.summary().audioStreamIndex,
+                     m_decoder.index(), initial, this);
     if (dlg.exec() != QDialog::Accepted) return;
     ExportSettings s = dlg.settings();
+    // Persist the exact mapping with the project so reopening reproduces the
+    // same output length and frame selection without re-approximation.
+    m_project.setExportConfig(dlg.exportConfig());
     s.outputPath = QFileDialog::getSaveFileName(
         this, tr("Render output"), QStringLiteral("slowmo.mkv"),
         tr("Matroska (*.mkv);;MP4 (*.mp4)"));
@@ -449,12 +455,13 @@ void MainWindow::exportRange()
     }
     QMessageBox::information(
         this, tr("Export complete"),
-        tr("Rendered: %1\nOutput frames: %2 (original %3, generated %4)\n"
-           "Measured output duration: %5 µs; expected %6 µs\n"
-           "Audio: %7\nProvenance sidecar: %8\n\n"
+        tr("Rendered: %1\nOutput frames: %2 (original %3, generated %4, freeze holds %5)\n"
+           "Measured output duration: %6 µs; mapping duration %7 µs\n"
+           "Audio: %8\nProvenance sidecar: %9\n\n"
            "Generated frames are explicitly marked; verify independently with: srt_probe verify")
             .arg(report.outputPath).arg(report.outputFrameCount)
             .arg(report.originalFrameCount).arg(report.generatedFrameCount)
+            .arg(report.freezeFrameCount)
             .arg(static_cast<qint64>(report.outputDurationUs))
             .arg(static_cast<qint64>(report.expectedDurationUs))
             .arg(Exporter::audioModeName(report.audioMode))

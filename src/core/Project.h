@@ -1,10 +1,29 @@
 #pragma once
 
+#include "core/SpeedCurve.h"
 #include "core/Types.h"
 #include <QObject>
 #include <QVector>
 
 namespace sr {
+
+// Persisted export configuration. The speed curve is saved as data, so a
+// reopened project renders the same mapping (and therefore the same output
+// duration and frame selection) without any re-approximation.
+struct ExportConfig {
+    int startFrame = 0;
+    int endFrame = 0;
+    bool hasCurve = false;
+    SpeedCurve curve;
+    double speed = 0.5;           // legacy constant speed, kept for v1 projects
+    int slowmoMode = 0;           // sr::SlowmoMode as int
+    int audioMode = 0;            // sr::AudioMode as int
+    int audioFreezePolicy = 0;    // sr::AudioFreezePolicy as int
+    int outputFrameRate = 60;
+
+    QJsonObject toJson() const;
+    static ExportConfig fromJson(const QJsonObject& o);
+};
 
 // A review project: markers bound to a source file via its digest and the
 // exact presentation timestamps recorded at marking time.
@@ -19,6 +38,10 @@ public:
     const SourceSummary& source() const { return m_source; }
     QVector<Marker>& markers() { return m_markers; }
     const QVector<Marker>& markers() const { return m_markers; }
+    ExportConfig& exportConfig() { return m_export; }
+    const ExportConfig& exportConfig() const { return m_export; }
+    void setExportConfig(const ExportConfig& c) { m_export = c; m_hasExport = true; }
+    bool hasExportConfig() const { return m_hasExport; }
 
     int addMarker(int frameIndex, int64_t ptsUs, MarkerPhase phase, const QString& note = {});
     void removeMarker(int id);
@@ -37,12 +60,17 @@ public:
     bool save(const QString& filePath, QString* err = nullptr);
     bool load(const QString& filePath, QString* err = nullptr);
 
-    static constexpr int fileFormatVersion = 1;
+    // v1 projects predate the segmented speed curve; they are still accepted.
+    // New writes use version 2.
+    static constexpr int fileFormatVersion = 2;
+    static constexpr int legacyFileFormatVersion = 1;
 
 private:
     QString m_path;
     SourceSummary m_source;
     QVector<Marker> m_markers;
+    ExportConfig m_export;
+    bool m_hasExport = false;
     int m_nextMarkerId = 1;
 };
 

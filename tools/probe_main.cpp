@@ -8,9 +8,14 @@
 //                                           the .frames.json provenance
 //   srt_probe readid <file> <frameIndex>    decode one exact frame and read
 //                                           its embedded synthetic frame id
+//   srt_probe mapping <sidecar> [--at-us S] dump the speed-curve mapping and
+//                                           the source time shown at output
+//                                           position S microseconds (or every
+//                                           planned frame when --at-us is out)
 //
 // Output is JSON on stdout so the test suite can parse it without Qt widgets.
 #include "core/VideoDecoder.h"
+#include "core/SpeedCurve.h"
 
 #include <QBuffer>
 #include <QFile>
@@ -221,6 +226,81 @@ static int cmdReadId(const QString& path, int frameIndex)
     return 0;
 }
 
+// Dump the source<->output time mapping stored in a sidecar. This is the
+// frame-by-frame inspection entry point for segmented speed-curve exports:
+// every planned output frame is listed with the exact source time and source
+// frame it resolves to, and an arbitrary output position can be queried.
+static int cmdMapping(const QString& sidecarPath, const QString& atUsArg)
+{
+    QFile sf(sidecarPath);
+    if (!sf.open(QIODevice::ReadOnly)) {
+        QJsonObject e; e["error"] = QStringLiteral("cannot open sidecar %1").arg(sidecarPath);
+        printf("%s\n", QJsonDocument(e).toJson(QJsonDocument::Compact).constData());
+        return 1;
+    }
+    const QJsonObject meta = QJsonDocument::fromJson(sf.readAll()).object();
+    const int64_t spanUs = static_cast<int64_t>(meta.value("sourceSpanUs").toDouble());
+    const SpeedCurve curve = SpeedCurve::fromJson(meta.value("speedCurve").toObject());
+    QString reason;
+    const bool valid = curve.validate(spanUs, &reason);
+
+    QJsonObject out;
+    out["sidecar"] = sidecarPath;
+    out["valid"] = valid;
+    if (!valid) out["reason"] = reason;
+    out["sourceSpanUs"] = static_cast<qint64>(spanUs);
+    out["outputDurationUs"] = static_cast<qint64>(curve.outputDurationUs());
+    out["hasCurve"] = meta.value("hasCurve").toBool();
+    QJsonArray segs;
+    for (const auto& seg : curve.inverseSegments()) {
+        QJsonObject so;
+        so["outStartUs"] = static_cast<qint64>(seg.outStartUs);
+        so["outEndUs"] = static_cast<qint64>(seg.outEndUs);
+        so["srcStartUs"] = static_cast<qint64>(seg.srcStartUs);
+        so["srcEndUs"] = static_cast<qint64>(seg.srcEndUs);
+        so["speed"] = seg.speed;
+        segs.append(so);
+    }
+    out["segments"] = segs;
+
+    if (!atUsArg.isEmpty()) {
+        bool parsed = false;
+        const int64_t atUs = atUsArg.toLongLong(&parsed);
+        if (!parsed) {
+            QJsonObject e; e["error"] = QStringLiteral("invalid --at-us value");
+            printf("%s\n", QJsonDocument(e).toJson(QJsonDocument::Compact).constData());
+            return 2;
+        }
+        out["queryOutputUs"] = static_cast<qint64>(atUs);
+        out["querySourceUs"] = static_cast<qint64>(curve.outputToSource(atUs));
+    } else {
+        QJsonArray farr;
+        int64_t lastSrc = -1;
+        bool monotone = true;
+        for (const auto& v : meta.value("frames").toArray()) {
+            const QJsonObject fo = v.toObject();
+            const int64_t srcUs = static_cast<int64_t>(
+                fo.value("sourceTimeUs").toDouble());
+            if (srcUs < lastSrc) monotone = false;
+            lastSrc = srcUs;
+            QJsonObject row;
+            row["outputIndex"] = fo.value("outputIndex").toInt();
+            row["outputPtsUs"] = fo.value("outputPtsUs");
+            row["sourceTimeUs"] = fo.value("sourceTimeUs");
+            row["sourceFrameA"] = fo.value("sourceFrameA");
+            row["sourceFrameB"] = fo.value("sourceFrameB");
+            row["kind"] = fo.value("kind");
+            row["segmentIndex"] = fo.value("segmentIndex");
+            row["localSpeed"] = fo.value("localSpeed");
+            farr.append(row);
+        }
+        out["frames"] = farr;
+        out["sourceTimeMonotone"] = monotone;
+    }
+    printf("%s\n", QJsonDocument(out).toJson(QJsonDocument::Indented).constData());
+    return valid ? 0 : 3;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 3) {
@@ -229,7 +309,8 @@ int main(int argc, char** argv)
                 "  srt_probe info <file>\n"
                 "  srt_probe frames <file> [--limit N]\n"
                 "  srt_probe verify <export> [sidecar]\n"
-                "  srt_probe readid <file> <frameIndex>\n");
+                "  srt_probe readid <file> <frameIndex>\n"
+                "  srt_probe mapping <sidecar> [--at-us US]\n");
         return 2;
     }
     const QString mode = argv[1];
@@ -246,6 +327,12 @@ int main(int argc, char** argv)
     if (mode == "readid") {
         if (argc < 4) return 2;
         return cmdReadId(path, atoi(argv[3]));
+    }
+    if (mode == "mapping") {
+        QString atUs;
+        for (int i = 3; i < argc; ++i)
+            if (QString(argv[i]) == "--at-us" && i + 1 < argc) atUs = argv[++i];
+        return cmdMapping(path, atUs);
     }
     fprintf(stderr, "unknown mode %s\n", argv[1]);
     return 2;
